@@ -3453,8 +3453,7 @@ struct InvokeData
     texpr
 end
 
-function inline_as_constant(val::ANY, argexprs, sv::InferenceState,
-                            invoke_data::ANY)
+function inline_as_constant(val::ANY, argexprs, sv::InferenceState, invoke_data::ANY)
     if invoke_data === nothing
         invoke_fexpr = nothing
         invoke_texpr = nothing
@@ -3647,8 +3646,9 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
 
     if (f === typeassert || ft ⊑ typeof(typeassert)) && length(atypes)==3
         # typeassert(x::S, T) => x, when S<:T
-        if isType(atypes[3]) && isleaftype(atypes[3]) &&
-            atypes[2] ⊑ atypes[3].parameters[1]
+        a3 = atypes[3]
+        if (isType(a3) && isleaftype(a3) && atypes[2] ⊑ a3.parameters[1]) ||
+            (isa(a3,Const) && isa(a3.val,Type) && atypes[2] ⊑ a3.val)
             return (argexprs[2], ())
         end
     end
@@ -3657,7 +3657,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
     if sv.params.inlining
         if isa(e.typ, Const) # || isconstType(e.typ)
             if (f === apply_type || f === fieldtype || f === typeof ||
-                istopfunction(topmod, f, :typejoin) ||
+                istopfunction(topmod, f, :typejoin) || f === (===) ||
                 istopfunction(topmod, f, :isbits) ||
                 istopfunction(topmod, f, :promote_type) ||
                 (f === Core.kwfunc && length(argexprs) == 2))
