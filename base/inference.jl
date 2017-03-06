@@ -276,23 +276,19 @@ end
 # create copies of the CodeInfo definition, and any fields that type-inference might modify
 # TODO: post-inference see if we can swap back to the original arrays
 function get_source(li::MethodInstance)
-    src = ccall(:jl_copy_code_info, Ref{CodeInfo}, (Any,), li.def.source)
-    if isa(src.code, Array{UInt8,1})
-        src.code = ccall(:jl_uncompress_ast, Any, (Any, Any), li.def, src.code)
+    if isa(li.def.source, Array{UInt8,1})
+        src = ccall(:jl_uncompress_ast, Any, (Any, Any, Cint), li.def, li.def.source, true)
     else
+        src = ccall(:jl_copy_code_info, Ref{CodeInfo}, (Any,), li.def.source)
         src.code = copy_exprargs(src.code)
+        src.slotnames = copy(src.slotnames)
+        src.slotflags = copy(src.slotflags)
     end
-    src.slotnames = copy(src.slotnames)
-    src.slotflags = copy(src.slotflags)
     return src
 end
 
 function get_staged(li::MethodInstance)
-    src = ccall(:jl_code_for_staged, Any, (Any,), li)::CodeInfo
-    if isa(src.code, Array{UInt8,1})
-        src.code = ccall(:jl_uncompress_ast, Any, (Any, Any), li.def, src.code)
-    end
-    return src
+    return ccall(:jl_code_for_staged, Any, (Any,), li)::CodeInfo
 end
 
 
@@ -1565,7 +1561,7 @@ function pure_eval_call(f::ANY, argtypes::ANY, atype::ANY, sv::InferenceState)
     meth = meth[1]::SimpleVector
     method = meth[3]::Method
     # TODO: check pure on the inferred thunk
-    if method.isstaged || !method.source.pure
+    if method.isstaged || !method.pure
         return false
     end
 
@@ -2501,7 +2497,6 @@ function typeinf_code(linfo::MethodInstance, optimize::Bool, cached::Bool,
                     tree.slottypes = nothing
                     tree.ssavaluetypes = 0
                     tree.inferred = true
-                    tree.pure = true
                     tree.inlineable = true
                     i == 2 && ccall(:jl_typeinf_end, Void, ())
                     return svec(linfo, tree, linfo.rettype)
@@ -2947,9 +2942,6 @@ function optimize(me::InferenceState)
                 end
             end
         end
-        if proven_pure
-            me.src.pure = true
-        end
 
         if proven_pure && !coverage_enabled()
             # use constant calling convention
@@ -3011,7 +3003,7 @@ function finish(me::InferenceState)
             end
             if me.const_api
                 # use constant calling convention
-                inferred_result = inferred_const
+                inferred_result = nothing
             else
                 inferred_result = me.src
             end
@@ -3024,7 +3016,7 @@ function finish(me::InferenceState)
                         inferred_result = nothing
                     else
                         # compress code for non-toplevel thunks
-                        inferred_result.code = ccall(:jl_compress_ast, Any, (Any, Any), me.linfo.def, inferred_result.code)
+                        inferred_result = ccall(:jl_compress_ast, Any, (Any, Any), me.linfo.def, inferred_result)
                     end
                 end
             end
@@ -3797,10 +3789,10 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
         if f === return_type
             if isconstType(e.typ)
                 return inline_as_constant(e.typ.parameters[1], argexprs, sv, invoke_data)
-            elseif isa(e.typ,Const)
+            elseif isa(e.typ, Const)
                 return inline_as_constant(e.typ.val, argexprs, sv, invoke_data)
             end
-        elseif method.source.pure && isa(e.typ,Const) && e.typ.actual
+        elseif method.pure && isa(e.typ, Const) && e.typ.actual
             return inline_as_constant(e.typ.val, argexprs, sv, invoke_data)
         end
     end
@@ -3857,13 +3849,13 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
     if linfo.jlcall_api == 2
         # in this case function can be inlined to a constant
         add_backedge(linfo, sv)
-        return inline_as_constant(linfo.inferred, argexprs, sv, invoke_data)
+        return inline_as_constant(linfo.inferred_const, argexprs, sv, invoke_data)
     end
 
     # see if the method has a current InferenceState frame
     # or existing inferred code info
     frame = nothing # Union{Void, InferenceState}
-    src = nothing # Union{Void, CodeInfo}
+    inferred = nothing # Union{Void, CodeInfo}
     if force_infer && isa(atypes[3], Const)
         # Since we inferred this with the information that atypes[3]::Const,
         # must inline with that same information.
@@ -3877,9 +3869,9 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
         frame.stmt_types[1][3] = VarState(atypes[3], false)
         typeinf_loop(frame)
     else
-        if isdefined(linfo, :inferred) && isa(linfo.inferred, CodeInfo) && (linfo.inferred::CodeInfo).inferred
+        if isdefined(linfo, :inferred) && linfo.inferred !== nothing
             # use cache
-            src = linfo.inferred
+            inferred = linfo.inferred
         elseif linfo.inInference
             # use WIP
             frame = typeinf_active(linfo)
@@ -3896,7 +3888,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
     if isa(frame, InferenceState)
         frame = frame::InferenceState
         linfo = frame.linfo
-        src = frame.src
+        inferred = frame.src
         if frame.const_api # handle like jlcall_api == 2
             if frame.inferred || !frame.cached
                 add_backedge(frame.linfo, sv)
@@ -3916,15 +3908,26 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
         rettype = linfo.rettype
     end
 
+    inferred === nothing && return invoke_NF(argexprs0, e.typ, atypes, sv,
+                                        atype_unlimited, invoke_data)
+
     # check that the code is inlineable
-    isa(src, CodeInfo) || return invoke_NF(argexprs0, e.typ, atypes, sv,
-                                           atype_unlimited, invoke_data)
-    src = src::CodeInfo
-    ast = src.code
+    if isa(inferred, CodeInfo)
+        src = inferred
+    else
+        src = ccall(:jl_uncompress_ast, Any, (Any, Any, Cint), method, inferred, false)::CodeInfo
+    end
     if !src.inferred || !src.inlineable
         return invoke_NF(argexprs0, e.typ, atypes, sv, atype_unlimited,
                          invoke_data)
     end
+
+    if isa(inferred, CodeInfo)
+        ast = copy_exprargs(inferred.code)
+    else
+        ast = (ccall(:jl_uncompress_ast, Any, (Any, Any, Cint), method, inferred, true)::CodeInfo).code
+    end
+    ast = ast::Array{Any,1}
 
     # create the backedge
     if isa(frame, InferenceState) && !frame.inferred && frame.cached
@@ -3947,13 +3950,6 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
     end
 
     nm = length(unwrap_unionall(metharg).parameters)
-
-    if !isa(ast, Array{Any,1})
-        ast = ccall(:jl_uncompress_ast, Any, (Any, Any), method, ast)
-    else
-        ast = copy_exprargs(ast)
-    end
-    ast = ast::Array{Any,1}
 
     body = Expr(:block)
     body.args = ast
